@@ -1,0 +1,27 @@
+# DX Cloudflare trusted-IP updater. Put it behind NPM (10.23.23.176) with HTTPS; see README.
+services:
+  cfip:
+    build: ./server
+    image: dx-cfip:latest          # built locally from python:latest
+    container_name: dx-cfip
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${CFIP_PORT:-8090}:8080"  # only NPM needs to reach this; firewall it to 10.23.23.176
+    volumes:
+      - cfip-data:/data            # clients.json (token hashes) + state.json (IPs, alerts)
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  cfip-data:

@@ -1,0 +1,27 @@
+# secrets / credentials
+.env
+*.env
+!.env.example
+auth.*
+*token*
+*.pem
+*.key
+*.pfx
+credentials*
+cfip-collector.json
+# runtime data
+data/
+*.db
+*.sqlite*
+*.log
+# caches / build output
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv*/
+dist/
+# backups
+*.bak
+*.orig
+*~
