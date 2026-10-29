@@ -62,6 +62,9 @@ BeforeAll {
             '  RegisterTask = { param($Arguments) Add-Content $env:FAKE_LOG "register:$Arguments" }',
             '  UnregisterTask = { Add-Content $env:FAKE_LOG "unregister"; $true }',
             '  RunCollector = { param($Arguments) Add-Content $env:FAKE_LOG "run:$Arguments"; 0 }',
+            '  GetTaskArguments = { [string]$env:FAKE_TASKARGS }; Is64BitOS = { $true }',
+            '  GetRegDword = { param($Path, $Name) $null }',
+            '  SetRegDword = { param($Path, $Name, $Value) Add-Content $env:FAKE_LOG "reg:$Path\$Name=$Value" }',
             '}')
         if ($Ops) { $lines += $Ops }
         foreach ($k in $Env.Keys) { $lines += "`$env:$k = '$($Env[$k])'" }
@@ -71,7 +74,7 @@ BeforeAll {
     function script:Invoke-OneLiner([hashtable]$Env, [string]$Ops = '', [string]$Url = $RepoUrl, [string[]]$ExtraArgs = @(), [string]$Pre = '', [string]$Post = '') {
         $tmp = New-TempDir
         $fake = Join-Path $tmp 'fake.log'
-        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_REPOURL = $Url }
+        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = (Join-Path $tmp 'OLDDX'); DX_CFIP_REPOURL = $Url }
         foreach ($k in $Env.Keys) { $e[$k] = $Env[$k] }
         $body = (New-Prologue -Env $e -FakeLog $fake -Ops $Ops) + "`n$Pre`nirm '$Url/install.ps1' | iex`n" +
         "`"RC=`$LASTEXITCODE`"; `"TOKENENV=[`$env:DX_CFIP_TOKEN]`"`n$Post`n'ALIVE'"
@@ -112,12 +115,14 @@ Describe 'install.ps1 via irm | iex' {
         $r.Fake | Should -Match 'register:.*-File ".*Invoke-DXCfipCollector\.ps1" -ConfigPath ".*cfip-collector\.json" -StateDir ".*State" -LogDir ".*Logs"'
         $r.Fake | Should -Match 'run:'
         $r.Out | Should -Match 'SHA256 OK'
+        $r.Out | Should -Match ('install root ' + [regex]::Escape((Join-Path $r.Root 'DX')))   # DX_CFIP_ROOTDIR override
+        $r.Fake | Should -Not -Match 'reg:'                                                    # DX_CFIP_FIXTLS off by default
         $r.Out.Contains($EnvTok) | Should -BeFalse
         $r.Fake.Contains($EnvTok) | Should -BeFalse
     }
     It 'also works as & ([scriptblock]::Create((irm ...)))' {
         $tmp = New-TempDir
-        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_REPOURL = $RepoUrl } + $Good
+        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = (Join-Path $tmp 'OLDDX'); DX_CFIP_REPOURL = $RepoUrl } + $Good
         $body = (New-Prologue -Env $e -FakeLog (Join-Path $tmp 'f.log')) + "`n& ([scriptblock]::Create((irm '$RepoUrl/install.ps1')))`n`"RC=`$LASTEXITCODE`"`n'ALIVE'"
         $out = (Invoke-Child -Body $body).Out
         $out | Should -Match 'RC=0'
@@ -128,6 +133,32 @@ Describe 'install.ps1 via irm | iex' {
         $r.Rc | Should -Be 0
         $r.Config.HeartbeatHours | Should -Be 12
         $r.Config.ReportUrl | Should -Be 'https://cfip.example.com.au/report'
+    }
+    It 'DX_CFIP_FIXTLS=1 sets the 4 .NET TLS values (both registry views)' {
+        $r = Invoke-OneLiner -Env ($Good + @{ DX_CFIP_FIXTLS = '1' })
+        $r.Rc | Should -Be 0
+        @([regex]::Matches($r.Fake, '(?m)^reg:.*=1')).Count | Should -Be 4
+        $r.Fake | Should -Match 'WOW6432Node.*SchUseStrongCrypto'
+        $r.Out | Should -Match 'New processes'
+    }
+    It 'migrates an install from the old root and reuses its token when DX_CFIP_TOKEN is empty' {
+        $tmp = New-TempDir
+        $old = Join-Path $tmp 'OLDDX'
+        New-Item -ItemType Directory (Join-Path $old 'Config'), (Join-Path $old 'Scripts') -Force | Out-Null
+        @{ ClientCode = 'ACME'; ReportUrl = 'https://cfip.example.com.au/report'; Token = $EnvTok; HeartbeatHours = 6 } | ConvertTo-Json |
+            Set-Content (Join-Path $old 'Config/cfip-collector.json')
+        Set-Content (Join-Path $old 'Scripts/Invoke-DXCfipCollector.ps1') '# old'
+        $fake = Join-Path $tmp 'fake.log'
+        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = $old; DX_CFIP_REPOURL = $RepoUrl
+            DX_CFIP_CLIENTCODE = 'acme'; DX_CFIP_ENDPOINT = 'https://cfip.example.com.au' }
+        $body = (New-Prologue -Env $e -FakeLog $fake) + "`nirm '$RepoUrl/install.ps1' | iex`n`"RC=`$LASTEXITCODE`""
+        $out = (Invoke-Child -Body $body).Out
+        $out | Should -Match 'RC=0'
+        $out | Should -Match 'reusing the token'
+        $out | Should -Match 'migration: done'
+        (Get-Content (Join-Path $tmp 'DX/Config/cfip-collector.json') -Raw | ConvertFrom-Json).Token | Should -Be $EnvTok
+        Test-Path $old | Should -BeFalse
+        $out.Contains($EnvTok) | Should -BeFalse
     }
     It 'skips the first run with DX_CFIP_NORUNNOW=1' {
         $r = Invoke-OneLiner -Env ($Good + @{ DX_CFIP_NORUNNOW = '1' })
@@ -179,7 +210,7 @@ Describe 'install.ps1 via irm | iex' {
     }
     It 'uninstall removes task, collector, config and state but keeps logs' {
         $tmp = New-TempDir
-        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_REPOURL = $RepoUrl }
+        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = (Join-Path $tmp 'OLDDX'); DX_CFIP_REPOURL = $RepoUrl }
         $fake = Join-Path $tmp 'f.log'
         $body = (New-Prologue -Env ($e + $Good) -FakeLog $fake) + "`nirm '$RepoUrl/install.ps1' | iex`n" +
         "Set-Content '$tmp/DX/State/cfip-collector-state.json' '{}'; Set-Content '$tmp/DX/Logs/DX-CFIP-Collector.log' 'x'`n" +
@@ -245,13 +276,13 @@ Describe 'install.ps1 download verification' {
     }
     It 'exits 3 when the download fails' {
         $tmp = New-TempDir
-        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_REPOURL = 'http://127.0.0.1:1' } + $Good
+        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = (Join-Path $tmp 'OLDDX'); DX_CFIP_REPOURL = 'http://127.0.0.1:1' } + $Good
         $body = (New-Prologue -Env $e -FakeLog (Join-Path $tmp 'f.log')) + "`n(irm '$RepoUrl/install.ps1') | iex`n`"RC=`$LASTEXITCODE`"`n'ALIVE'"
         (Invoke-Child -Body $body).Out | Should -Match 'RC=3'
     }
     It 'rejects a non-https DX_CFIP_REPOURL with 1' {
         $tmp = New-TempDir
-        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_REPOURL = 'http://evil.example' } + $Good
+        $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = (Join-Path $tmp 'OLDDX'); DX_CFIP_REPOURL = 'http://evil.example' } + $Good
         $body = (New-Prologue -Env $e -FakeLog (Join-Path $tmp 'f.log')) + "`nirm '$RepoUrl/install.ps1' | iex`n`"RC=`$LASTEXITCODE`"`n'ALIVE'"
         (Invoke-Child -Body $body).Out | Should -Match 'RC=1'
     }
@@ -274,7 +305,7 @@ Describe 'non-interactive (RMM) behaviour' {
         # Exactly how an RMM runs it: powershell -NonInteractive -Command "...; irm <url> | iex"
         function script:Invoke-Rmm([hashtable]$Env, [string]$Ops = '') {
             $tmp = New-TempDir
-            $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_REPOURL = $RepoUrl } + $Env
+            $e = @{ DX_CFIP_ROOTDIR = (Join-Path $tmp 'DX'); DX_CFIP_LEGACYROOTDIR = (Join-Path $tmp 'OLDDX'); DX_CFIP_REPOURL = $RepoUrl } + $Env
             $pro = Join-Path $tmp 'prologue.ps1'
             Set-Content -LiteralPath $pro -Value (New-Prologue -Env $e -FakeLog (Join-Path $tmp 'f.log') -Ops $Ops)
             $out = & $Pwsh -NoProfile -NonInteractive -Command ". '$pro'; irm '$RepoUrl/install.ps1' | iex; 'ALIVE'" 2>&1 | Out-String
@@ -312,7 +343,7 @@ Describe 'N-central installer shares the same code' {
             $path = Join-Path $dist 'Install-DXCfipCollector.bundle.ps1'   # alone in its folder: needs no neighbour files
         }
         $body = (New-Prologue -Env @{} -FakeLog (Join-Path $tmp 'f.log')) +
-        "`n& '$path' -ClientCode acme -ReportUrl https://h.example/report -Token $EnvTok -RootDir '$tmp/DX'`n`"RC=`$LASTEXITCODE`""
+        "`n& '$path' -ClientCode acme -ReportUrl https://h.example/report -Token $EnvTok -RootDir '$tmp/DX' -LegacyRootDir '$tmp/OLDDX'`n`"RC=`$LASTEXITCODE`""
         $r = Invoke-Child -Body $body -ExtraArgs @('-NonInteractive')
         $r.Out | Should -Match 'RC=0'
         $r.Out | Should -Match 'install finished'
@@ -323,14 +354,14 @@ Describe 'N-central installer shares the same code' {
     It 'N-central installer -Uninstall works through the shared code' {
         $tmp = New-TempDir
         $body = (New-Prologue -Env @{} -FakeLog (Join-Path $tmp 'f.log')) +
-        "`n& '$(Join-Path $Root 'collector/Install-DXCfipCollector.ps1')' -Uninstall -RootDir '$tmp/DX'`n`"RC=`$LASTEXITCODE`""
+        "`n& '$(Join-Path $Root 'collector/Install-DXCfipCollector.ps1')' -Uninstall -RootDir '$tmp/DX' -LegacyRootDir '$tmp/OLDDX'`n`"RC=`$LASTEXITCODE`""
         (Invoke-Child -Body $body -ExtraArgs @('-NonInteractive')).Out | Should -Match 'RC=0'
         Get-Content (Join-Path $tmp 'f.log') -Raw | Should -Match 'unregister'
     }
     It 'N-central installer returns 2 when not elevated' {
         $tmp = New-TempDir
         $body = (New-Prologue -Env @{} -FakeLog (Join-Path $tmp 'f.log') -Ops '$global:DXCfipOpsOverride.IsElevated = { $false }') +
-        "`n& '$(Join-Path $Root 'collector/Install-DXCfipCollector.ps1')' -ClientCode ACME -ReportUrl https://h.example/report -Token $EnvTok -RootDir '$tmp/DX'`n`"RC=`$LASTEXITCODE`""
+        "`n& '$(Join-Path $Root 'collector/Install-DXCfipCollector.ps1')' -ClientCode ACME -ReportUrl https://h.example/report -Token $EnvTok -RootDir '$tmp/DX' -LegacyRootDir '$tmp/OLDDX'`n`"RC=`$LASTEXITCODE`""
         (Invoke-Child -Body $body).Out | Should -Match 'RC=2'
         Test-Path "$tmp/DX/Config/cfip-collector.json" | Should -BeFalse
     }

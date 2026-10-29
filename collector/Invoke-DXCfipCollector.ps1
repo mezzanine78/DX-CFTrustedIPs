@@ -14,9 +14,9 @@ a per-client report token that can do nothing except report this client's IP.
      so the server can use the source address it sees.
 
 Windows PowerShell 5.1 and pwsh 7. irm|iex-safe (body in & { }, exit only when non-interactive).
-  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\DX\Scripts\Invoke-DXCfipCollector.ps1
+  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Windows\Scripts\DX\Scripts\Invoke-DXCfipCollector.ps1
 
-Settings: parameter > environment variable > config file (C:\DX\Config\cfip-collector.json, ACL SYSTEM +
+Settings: parameter > environment variable > config file (C:\Windows\Scripts\DX\Config\cfip-collector.json, ACL SYSTEM +
 Administrators only, written by the installer). Env: DX_CFIP_CLIENTCODE, DX_CFIP_REPORTURL, DX_CFIP_TOKEN,
 DX_CFIP_HEARTBEATHOURS. The token is never written to the log or the console.
 
@@ -34,11 +34,11 @@ param(
     [string]$ClientCode = '',
     [string]$ReportUrl = '',          # e.g. https://cfip.example.com.au/report
     [string]$Token = '',              # prefer the config file / N-central secure property over this
-    [string]$ConfigPath = '',         # default C:\DX\Config\cfip-collector.json
+    [string]$ConfigPath = '',         # default C:\Windows\Scripts\DX\Config\cfip-collector.json
     [int]$HeartbeatHours = -1,        # default 6
     [string[]]$IpProviders = @(),     # default ipify, icanhazip, ifconfig.me
-    [string]$StateDir = '',           # default C:\DX\State
-    [string]$LogDir = '',             # default C:\DX\Logs
+    [string]$StateDir = '',           # default C:\Windows\Scripts\DX\State
+    [string]$LogDir = '',             # default C:\Windows\Scripts\DX\Logs
     [int]$TimeoutSec = 10,
     [switch]$Force,                   # report even if unchanged
     [switch]$DryRun,                  # detect and log the IP, do not report
@@ -50,9 +50,10 @@ $__DXScriptPath = $MyInvocation.MyCommand.Path
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
-    $ScriptVersion = '1.0.0'
+    $ScriptVersion = '1.1.0'
     $DefaultProviders = @('https://api.ipify.org', 'https://ipv4.icanhazip.com', 'https://ifconfig.me/ip')
     $script:LogFile = $null
+    $script:TlsDiagDone = $false
 
     function Write-DXLog([string]$Msg, [string]$Level = 'INFO') {
         $line = '{0} DX cfip-collector {1,-5} {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Msg
@@ -99,19 +100,91 @@ $__DXScriptPath = $MyInvocation.MyCommand.Path
         return $true
     }
 
+    function Get-DXTlsProtocolSet([int]$Current, [int]$Build, [bool]$IsWin, [string[]]$Names) {
+        # Existing flags -bor Tls12 (3072); -bor Tls13 (12288) only when this .NET has the enum value AND the OS
+        # can do it (Windows build 20348+ / Win11, or non-Windows). Forcing Tls13 on older Windows makes .NET
+        # Framework fail every handshake, so it is not added there.
+        $p = $Current -bor 3072
+        if ($Names -contains 'Tls13' -and (-not $IsWin -or $Build -ge 20348)) { $p = $p -bor 12288 }
+        return $p
+    }
+
     function Enable-DXTlsProtocol {
-        # TLS 1.2 always; TLS 1.3 only where the OS supports it (Windows build 20348+ / Win11).
-        # Forcing Tls13 on older Windows breaks the handshake under .NET Framework.
+        # Runs in every collector process (the scheduled task is a new process: the installer's setting does not carry over).
         try {
-            $p = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
             $build = 0
-            if ($env:OS -eq 'Windows_NT') { $build = [Environment]::OSVersion.Version.Build }
-            if ($build -ge 20348 -and [enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
-                $p = $p -bor [Net.SecurityProtocolType]::Tls13
-            }
-            [Net.ServicePointManager]::SecurityProtocol = $p
+            $isWinOs = ($env:OS -eq 'Windows_NT')
+            if ($isWinOs) { $build = [Environment]::OSVersion.Version.Build }
+            $p = Get-DXTlsProtocolSet -Current ([int][Net.ServicePointManager]::SecurityProtocol) -Build $build -IsWin $isWinOs `
+                -Names ([enum]::GetNames([Net.SecurityProtocolType]))
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]$p
+            Write-DXLog "TLS protocols: $([Net.ServicePointManager]::SecurityProtocol)"
         }
-        catch { $null = $_ }
+        catch { Write-DXLog "could not set TLS protocols: $($_.Exception.Message)" 'WARN' }
+    }
+
+    function Test-DXTlsFailure($Exception) {
+        # True for a TLS handshake / secure channel failure anywhere in the exception chain.
+        $e = $Exception
+        $n = 0
+        while ($null -ne $e -and $n -lt 10) {
+            if ($e -is [Net.WebException] -and $e.Status -eq [Net.WebExceptionStatus]::SecureChannelFailure) { return $true }
+            if ($e -is [Security.Authentication.AuthenticationException]) { return $true }
+            if ([string]$e.Message -match 'SSL/TLS|secure channel|SSL connection could not be established|TLS handshake') { return $true }
+            $e = $e.InnerException
+            $n++
+        }
+        return $false
+    }
+
+    function ConvertTo-DXNetFxVersion([int]$Release) {
+        $map = @(@(533320, '4.8.1'), @(528040, '4.8'), @(461808, '4.7.2'), @(461308, '4.7.1'), @(460798, '4.7'),
+            @(394802, '4.6.2'), @(394254, '4.6.1'), @(393295, '4.6'), @(379893, '4.5.2'), @(378675, '4.5.1'), @(378389, '4.5'))
+        foreach ($m in $map) { if ($Release -ge $m[0]) { return $m[1] } }
+        if ($Release -gt 0) { return 'older than 4.5' }
+        return 'not found'
+    }
+
+    function Get-DXPlatformInfo {
+        $i = [ordered]@{ Caption = ''; Build = 0; PSVersion = [string]$PSVersionTable.PSVersion; NetRelease = 0 }
+        if ($env:OS -eq 'Windows_NT') {
+            try {
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+                $i.Caption = [string]$os.Caption; $i.Build = [int]$os.BuildNumber
+            }
+            catch {
+                try {
+                    $k = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+                    $i.Caption = [string]$k.ProductName; $i.Build = [int]$k.CurrentBuildNumber
+                }
+                catch { $null = $_ }
+            }
+            try { $i.NetRelease = [int](Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -Name Release -ErrorAction Stop).Release }
+            catch { $null = $_ }
+        }
+        if (-not $i.Build) { $i.Build = [Environment]::OSVersion.Version.Build }
+        if (-not $i.Caption) { $i.Caption = [Environment]::OSVersion.VersionString }
+        return [pscustomobject]$i
+    }
+
+    function Get-DXTlsAdvice($Info) {
+        $lines = @(
+            "TLS handshake failed on $($Info.Caption) (build $($Info.Build)), PowerShell $($Info.PSVersion), .NET Framework $(ConvertTo-DXNetFxVersion $Info.NetRelease) (release $($Info.NetRelease))",
+            'TLS hint: let .NET use strong crypto / the OS TLS defaults: set DWORD SchUseStrongCrypto=1 and SystemDefaultTlsVersions=1 under HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319 and HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319 (or re-run the installer with DX_CFIP_FIXTLS=1), then let the task run again')
+        if ($Info.Build -eq 9600) {
+            $lines += 'TLS hint (Windows 8.1 / Server 2012 R2, build 9600): install the latest rollup updates (the KB3140245-era TLS 1.2 updates and later); Cloudflare requires TLS 1.2 with ECDHE-GCM cipher suites, which an unpatched 2012 R2 does not offer'
+        }
+        elseif ($Info.Build -gt 0 -and $Info.Build -lt 9600 -and $env:OS -eq 'Windows_NT') {
+            $lines += 'TLS hint: this Windows is older than 8.1 / 2012 R2; it needs KB3140245 and the TLS 1.2 updates, and may not be able to reach Cloudflare at all'
+        }
+        return $lines
+    }
+
+    function Write-DXTlsDiagnostic {
+        if ($script:TlsDiagDone) { return }
+        $script:TlsDiagDone = $true
+        try { foreach ($l in (Get-DXTlsAdvice (Get-DXPlatformInfo))) { Write-DXLog $l 'WARN' } }
+        catch { Write-DXLog "TLS diagnostics failed: $($_.Exception.Message)" 'WARN' }
     }
 
     function Get-DXPublicIPv4([string[]]$Providers, [int]$Timeout) {
@@ -131,6 +204,7 @@ $__DXScriptPath = $MyInvocation.MyCommand.Path
             }
             catch {
                 Write-DXLog "provider $u failed: $($_.Exception.Message), trying next" 'WARN'
+                if (Test-DXTlsFailure $_.Exception) { Write-DXTlsDiagnostic }
             }
         }
         return $null
@@ -155,7 +229,9 @@ $__DXScriptPath = $MyInvocation.MyCommand.Path
 
     # ---------------------------------------------------------------- main
     $isWin = ($env:OS -eq 'Windows_NT')
-    $root = 'C:\DX'
+    $sysRoot = [string]$env:SystemRoot
+    if (-not $sysRoot) { $sysRoot = 'C:\Windows' }
+    $root = $sysRoot.TrimEnd('\', '/') + '\Scripts\DX'
     if (-not $LogDir) { $LogDir = Join-Path $root 'Logs' }
     if (-not $StateDir) { $StateDir = Join-Path $root 'State' }
     if (-not $ConfigPath) { $ConfigPath = Join-Path $root 'Config\cfip-collector.json' }
@@ -232,6 +308,7 @@ $__DXScriptPath = $MyInvocation.MyCommand.Path
         if ($status -ge 400 -and $status -lt 500 -and $status -ne 429) { Exit-Collector 5 "report rejected HTTP $status"; return }
         $why = $_.Exception.Message
         if ($status) { $why = "HTTP $status" }
+        elseif (Test-DXTlsFailure $_.Exception) { Write-DXTlsDiagnostic }
         Exit-Collector 3 "report failed: $why"; return
     }
     $saved = @{ Ip = [string]$result.ip; LastReportUtc = $nowUtc.ToString('o'); LastStatus = [string]$result.status; ObservedIp = [string]$result.observed_ip }

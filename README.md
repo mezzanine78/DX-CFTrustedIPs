@@ -165,9 +165,11 @@ For a fixed release, point both the `irm` URL and `DX_CFIP_REPOURL` at a commit:
 ```powershell
 $env:DX_CFIP_UNINSTALL='1'; irm https://raw.githubusercontent.com/mezzanine78/DX-CFTrustedIPs/main/install.ps1 | iex; Remove-Item Env:DX_CFIP_UNINSTALL
 ```
-Removes the task `\DX\DX-CFIP-Collector`, `C:\DX\Scripts\Invoke-DXCfipCollector.ps1`, `C:\DX\Config\cfip-collector.json`
-(the token) and the collector state file. **Logs are kept** (`C:\DX\Logs\DX-CFIP-Collector.log`): the folder is shared with
-other DX tools, the log holds no secrets, and it is the record of what the machine reported. Delete it by hand if wanted.
+Removes the task `\DX\DX-CFIP-Collector` and, from **both** `C:\Windows\Scripts\DX` and the old `C:\DX`, only our files:
+`Scripts\Invoke-DXCfipCollector.ps1`, `Config\cfip-collector.json` (the token) and `State\cfip-collector-state.json`; then
+any of those folders (and the root) left empty. Other files are never touched. **Logs are kept**
+(`C:\Windows\Scripts\DX\Logs\DX-CFIP-Collector.log`): the log holds no secrets and is the record of what the machine
+reported. Delete it by hand if wanted.
 Afterwards also `client disable`/`remove` the client on the central service.
 
 > **Token and PowerShell history.** Anything typed at the prompt line, including `$env:DX_CFIP_TOKEN='...'`, is saved by
@@ -185,7 +187,10 @@ Afterwards also `client disable`/`remove` the client on the central service.
 
 Inputs (env vars; `install.ps1` has no `param()` block so it works through `iex`): `DX_CFIP_CLIENTCODE`, `DX_CFIP_ENDPOINT`
 (`https://host` or `https://host/report`; `DX_CFIP_REPORTURL` also accepted), `DX_CFIP_TOKEN`, `DX_CFIP_HEARTBEATHOURS` (6),
-`DX_CFIP_UNINSTALL=1`, `DX_CFIP_NORUNNOW=1`, `DX_CFIP_ROOTDIR` (`C:\DX`), `DX_CFIP_REPOURL`.
+`DX_CFIP_UNINSTALL=1`, `DX_CFIP_NORUNNOW=1`, `DX_CFIP_FIXTLS=1` (see *TLS* below), `DX_CFIP_ROOTDIR`
+(`C:\Windows\Scripts\DX`), `DX_CFIP_LEGACYROOTDIR` (`C:\DX`, the old root to migrate from), `DX_CFIP_REPOURL`.
+If `DX_CFIP_TOKEN` is empty and an existing config (new or old root) holds a token for the **same** client code, that
+token is reused (no prompt) – handy for the migration re-run.
 
 What it does:
 1. TLS 1.2 (plus 1.3 on Windows build 20348+).
@@ -194,7 +199,8 @@ What it does:
    **parses** and is the expected file. Any mismatch → exit 3, nothing installed.
 3. Checks that it's elevated, validates the inputs, gets the token (env var, or a hidden `Read-Host -AsSecureString` prompt
    when the session is interactive; never prompts as SYSTEM / `-NonInteractive`).
-4. Same install as the N-central installer (shared code): ACL'd config, hourly SYSTEM task, first run, result.
+4. Same install as the N-central installer (shared code): ACL'd folders, migration from `C:\DX` if found, hourly SYSTEM
+   task, first run, result (see *Install location, ACLs and migration* below).
 5. Always removes `$env:DX_CFIP_TOKEN` and drops its copies (SecureString disposed, BSTR zeroed), on success or failure.
    The token is never printed, logged or put on a command line (the first run and the task read it from the ACL'd file).
 
@@ -219,10 +225,11 @@ collector and prints: *Start > type PowerShell > right-click > Run as administra
    (server or reception PC), with parameters:
    `-ClientCode ACME -ReportUrl https://cfip.ausict.com/report -Token <token>`
    Put the token in a **password-type** custom property / AMP secure input rather than plain text where possible.
-4. It installs to `C:\DX\Scripts\Invoke-DXCfipCollector.ps1`, writes `C:\DX\Config\cfip-collector.json` (ACL: SYSTEM +
-   Administrators only), registers **`\DX\DX-CFIP-Collector`** (SYSTEM, hourly with up to 10 min random delay,
-   plus at startup +5 min, 10 min limit, no overlap) and runs it once.
-5. Uninstall: same script with `-Uninstall` (removes task, script, config, state; keeps `C:\DX\Logs`).
+4. It installs to `C:\Windows\Scripts\DX\Scripts\Invoke-DXCfipCollector.ps1`, writes
+   `C:\Windows\Scripts\DX\Config\cfip-collector.json`, registers **`\DX\DX-CFIP-Collector`** (SYSTEM, hourly with up to
+   10 min random delay, plus at startup +5 min, 10 min limit, no overlap) and runs it once. `-RootDir` (or
+   `DX_CFIP_ROOTDIR`) changes the root; `-FixTls` (or `DX_CFIP_FIXTLS=1`) applies the .NET TLS fix below.
+5. Uninstall: same script with `-Uninstall` (our files at the new and the old root; logs kept).
 
 Manual / irm|iex (signed in, elevated):
 ```powershell
@@ -230,8 +237,54 @@ $env:DX_CFIP_CLIENTCODE='ACME'; $env:DX_CFIP_REPORTURL='https://cfip.ausict.com/
 & .\Install-DXCfipCollector.bundle.ps1        # or: irm <url>/Install-DXCfipCollector.bundle.ps1 | iex
 Remove-Item Env:DX_CFIP_TOKEN
 ```
-Log: `C:\DX\Logs\DX-CFIP-Collector.log` (rotates at 1 MB, tag `DX cfip-collector`, never contains the token).
-Requires Windows 10 / Server 2016 or later (ScheduledTasks module, indefinite hourly repetition, TLS 1.2).
+Log: `C:\Windows\Scripts\DX\Logs\DX-CFIP-Collector.log` (rotates at 1 MB to `.log.1`, tag `DX cfip-collector`, never
+contains the token). Requires Windows 10 / Server 2016 or later (ScheduledTasks module, indefinite hourly repetition, TLS 1.2).
+
+### Install location, ACLs and migration
+
+```
+C:\Windows\Scripts\DX\            (DX_CFIP_ROOTDIR / -RootDir overrides; C:\Windows\Scripts is created if missing)
+  Scripts\Invoke-DXCfipCollector.ps1
+  Config\cfip-collector.json         client code, report URL, report token
+  State\cfip-collector-state.json
+  Logs\DX-CFIP-Collector.log (+ .log.1)
+```
+**ACLs (decision):** the root and each of `Scripts`, `Config`, `State`, `Logs` get an explicit, **protected** ACL
+(inheritance from `C:\Windows` removed): **SYSTEM (S-1-5-18) + Administrators (S-1-5-32-544), Full control**, inherited
+by files inside. The config file gets the same ACL directly. SIDs, not names, so it works on non-English Windows. No
+`Users` read on `Scripts`: the task runs as SYSTEM and nothing else needs the script, and keeping standard users out of the
+folder of a script that SYSTEM runs hourly is the safer default. `C:\Windows\Scripts` itself is left with the ACL it has
+(or inherits from `C:\Windows` when we create it). If you point `DX_CFIP_ROOTDIR` somewhere else, use a dedicated folder:
+it gets the same restricted ACL.
+
+**Migration from `C:\DX` (versions before this one):** an old install is detected when the scheduled task points into
+`C:\DX\` or any of our files exist there. The install then does a clean reinstall, logging each step (`migration: ...`):
+1. copies `Config\cfip-collector.json` and `State\cfip-collector-state.json` to the new root – the **newer file wins**, a
+   newer file already at the new root is never overwritten; the token is reused if none is given;
+2. **Logs (decision):** our `DX-CFIP-Collector.log` / `.log.1` are moved to the new `Logs` (old lines first if a new log
+   already exists); any other file in `C:\DX\Logs` is left alone;
+3. writes the collector and config at the new root and re-registers the task (`-Force`) pointing at it;
+4. only then deletes our known files from `C:\DX\Scripts`, `Config`, `State`, `Logs`, and removes those folders and
+   `C:\DX` itself **only if empty**. Unknown files are kept and listed in the output.
+If anything fails before step 4 the old install is left in place. Old root override: `DX_CFIP_LEGACYROOTDIR` / `-LegacyRootDir`.
+
+### TLS ("Could not create SSL/TLS secure channel")
+
+The collector sets TLS 1.2 (and TLS 1.3 where the .NET enum exists and Windows supports it, build 20348+) in its **own**
+process before any web call – the installer's setting does not carry over to the scheduled task. If a handshake still
+fails, the log gets the OS caption and build, PowerShell version, .NET Framework version (from the `NDP\v4\Full` Release
+value) and a hint (exit code stays 3). On Windows 8.1 / Server 2012 R2 (build 9600) it also says to install the TLS 1.2
+rollup updates: Cloudflare requires TLS 1.2 with ECDHE-GCM cipher suites.
+
+The usual fix is to let .NET Framework use strong crypto and the OS TLS defaults – four **machine-wide** DWORDs:
+```
+HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319              SchUseStrongCrypto=1  SystemDefaultTlsVersions=1
+HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319  SchUseStrongCrypto=1  SystemDefaultTlsVersions=1
+```
+The installer **only warns** if they are missing. With `DX_CFIP_FIXTLS=1` (one-liner) or `-FixTls` (N-central) it sets
+those that are missing or not 1 (the WOW6432Node pair only on 64-bit Windows) and logs each change. They affect every
+.NET Framework app on the machine; new processes (the next task run) pick them up, already-running apps need a restart,
+and a reboot covers everything.
 
 **Collector exit codes:** 0 OK (reported or nothing due) · 1 config error · 2 no public IPv4 determinable ·
 3 report failed (network/TLS/5xx/429) · 4 rejected 401/403 (token, disabled, IP not allowed) · 5 other 4xx.

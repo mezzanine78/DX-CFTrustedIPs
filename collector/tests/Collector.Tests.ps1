@@ -127,6 +127,54 @@ Describe 'Reporting, heartbeat and auth' {
     }
 }
 
+Describe 'TLS (end to end)' {
+    It 'sets TLS 1.2 (+1.3 where available) before the first provider call' {
+        $st = New-StateDir
+        $r = Invoke-Collector -Providers 'good' -State $st -Extra @('-DryRun')
+        $r.Code | Should -Be 0
+        $lines = $r.Out -split "`n"
+        $tls = [array]::FindIndex([string[]]$lines, [Predicate[string]] { param($l) $l -match 'TLS protocols: .*Tls12' })
+        $web = [array]::FindIndex([string[]]$lines, [Predicate[string]] { param($l) $l -match 'public IPv4|provider ' })
+        $tls | Should -BeGreaterOrEqual 0
+        $web | Should -BeGreaterThan $tls
+        if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') { $r.Out | Should -Match 'TLS protocols: .*Tls13' }
+    }
+    It 'a TLS handshake failure on the report exits 3 and logs platform info + the registry hint' {
+        $st = New-StateDir
+        $tlsUrl = ($Info.providers -replace '^http://', 'https://') + '/report'   # TLS to a plain-HTTP port fails the handshake
+        $r = Invoke-Collector -Providers 'good' -State $st -Url $tlsUrl -Extra @('-Force')
+        $r.Code | Should -Be 3
+        $log = Get-Content (Join-Path $st 'logs/DX-CFIP-Collector.log') -Raw
+        $log | Should -Match 'TLS handshake failed on .*\(build \d+\), PowerShell \d'
+        $log | Should -Match 'SchUseStrongCrypto=1 and SystemDefaultTlsVersions=1'
+        $log | Should -Match 'DX_CFIP_FIXTLS=1'
+        $log | Should -Match 'report failed'
+        $log.Contains($Info.token) | Should -BeFalse
+    }
+    It 'a non-TLS failure (connection refused) exits 3 without the TLS hint' {
+        $st = New-StateDir
+        $r = Invoke-Collector -Providers 'good' -State $st -Url 'http://127.0.0.1:1/report'
+        $r.Code | Should -Be 3
+        $r.Out | Should -Not -Match 'TLS hint'
+    }
+}
+
+Describe 'Default root' {
+    It 'uses %SystemRoot%\Scripts\DX\{Config,State,Logs} when no paths are given' {
+        $sr = New-StateDir
+        $keep = $env:SystemRoot
+        try {
+            $env:SystemRoot = $sr
+            & $Pwsh -NoProfile -NonInteractive -File $Collector -ClientCode ACME -ReportUrl $Info.report_url -Token $Info.token `
+                -AllowHttp -DryRun -IpProviders "$($Info.providers)/ip/good" *> $null
+            $LASTEXITCODE | Should -Be 0
+        }
+        finally { $env:SystemRoot = $keep }
+        Test-Path (Join-Path $sr 'Scripts/DX/Logs/DX-CFIP-Collector.log') | Should -BeTrue
+        Test-Path (Join-Path $sr 'Scripts/DX/State') | Should -BeTrue
+    }
+}
+
 Describe 'Configuration' {
     It 'exits 1 for <name>' -ForEach @(
         @{ name = 'missing client code'; code = ''; url = 'https://x.example/report'; tok = ('t' * 30); extra = @() },

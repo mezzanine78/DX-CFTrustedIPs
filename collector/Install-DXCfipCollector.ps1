@@ -2,8 +2,10 @@
 Install-DXCfipCollector.ps1 - N-central installer / uninstaller for the DX CF-IP collector.
 (For the irm|iex one-liner use install.ps1 at the repo root; both share collector/DXCfip.Install.ps1.)
 
-  * copies the collector to C:\DX\Scripts\Invoke-DXCfipCollector.ps1
-  * writes C:\DX\Config\cfip-collector.json (client code, report URL, report token, heartbeat), ACL SYSTEM + Administrators
+  * copies the collector to C:\Windows\Scripts\DX\Scripts\Invoke-DXCfipCollector.ps1
+  * writes C:\Windows\Scripts\DX\Config\cfip-collector.json (client code, report URL, report token, heartbeat);
+    every folder under C:\Windows\Scripts\DX is SYSTEM + Administrators only (by SID, inheritance removed)
+  * migrates an old install from C:\DX (config, state, our logs; task repointed; only our old files removed)
   * registers scheduled task \DX\DX-CFIP-Collector: SYSTEM, hourly (random delay up to 10 min) + at startup,
     Windows PowerShell 5.1, 10 min time limit, no overlapping runs
   * runs it once and reports the result
@@ -14,14 +16,15 @@ Shared code + collector (first found wins): copies embedded by tools/Build-Bundl
 N-central (run as LocalSystem):
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File Install-DXCfipCollector.bundle.ps1 -ClientCode ACME `
       -ReportUrl https://cfip.example.com.au/report -Token <token from 'python -m cfip client add'>
-  ... -Uninstall      removes the task, script, config and state (logs are kept)
+  ... -Uninstall      removes the task, script, config and state at the new and the old C:\DX root (logs are kept)
+  ... -FixTls         also sets the machine-wide .NET strong-crypto TLS registry values (or DX_CFIP_FIXTLS=1)
 
 Exit codes:
   0 = installed (first run OK) / uninstalled
   1 = error (bad parameters, copy/ACL/task registration failed, not Windows)
   2 = not elevated (needs Administrator or SYSTEM)
   3 = collector or shared install code not found / does not parse
-  4 = installed, but the first collector run failed (see C:\DX\Logs\DX-CFIP-Collector.log; task stays registered)
+  4 = installed, but the first collector run failed (see C:\Windows\Scripts\DX\Logs\DX-CFIP-Collector.log; task stays registered)
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Used inside the & { } block')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Console output for N-central')]
@@ -32,9 +35,11 @@ param(
     [string]$Token = '',
     [int]$HeartbeatHours = 6,
     [string]$CollectorSource = '',
-    [string]$RootDir = 'C:\DX',
+    [string]$RootDir = '',            # default C:\Windows\Scripts\DX (or DX_CFIP_ROOTDIR)
+    [string]$LegacyRootDir = '',      # default C:\DX (or DX_CFIP_LEGACYROOTDIR)
     [switch]$Uninstall,
-    [switch]$NoRunNow
+    [switch]$NoRunNow,
+    [switch]$FixTls
 )
 
 $__DXScriptPath = $MyInvocation.MyCommand.Path
@@ -85,7 +90,10 @@ $__DXScriptRoot = $PSScriptRoot
     if (-not (& $DXCfipOps.IsWindows)) { Exit-Install 1 'Windows only'; return }
     if (-not (& $DXCfipOps.IsElevated)) { Exit-Install 2 'run elevated (Administrator) or as SYSTEM'; return }
 
-    if ($Uninstall) { $rc = Invoke-DXCfipUninstall -RootDir $RootDir; Exit-Install $rc 'uninstall finished'; return }
+    $RootDir = Resolve-DXCfipRoot (Get-EnvOr $RootDir 'DX_CFIP_ROOTDIR')
+    $LegacyRootDir = Get-EnvOr $LegacyRootDir 'DX_CFIP_LEGACYROOTDIR'
+    if (-not $FixTls -and (Get-EnvOr '' 'DX_CFIP_FIXTLS') -match '^(1|true|yes|on)$') { $FixTls = $true }
+    if ($Uninstall) { $rc = Invoke-DXCfipUninstall -RootDir $RootDir -LegacyRootDir $LegacyRootDir; Exit-Install $rc 'uninstall finished'; return }
 
     $ClientCode = Get-EnvOr $ClientCode 'DX_CFIP_CLIENTCODE'
     $ReportUrl = ConvertTo-DXReportUrl (Get-EnvOr (Get-EnvOr $ReportUrl 'DX_CFIP_REPORTURL') 'DX_CFIP_ENDPOINT')
@@ -105,7 +113,7 @@ $__DXScriptRoot = $PSScriptRoot
     catch { Exit-Install 3 "could not load collector: $($_.Exception.Message)"; return }
 
     $rc = Invoke-DXCfipInstall -ClientCode $ClientCode -ReportUrl $ReportUrl -Token $Token -HeartbeatHours $HeartbeatHours `
-        -CollectorContent $content -RootDir $RootDir -NoRunNow:$NoRunNow
+        -CollectorContent $content -RootDir $RootDir -LegacyRootDir $LegacyRootDir -NoRunNow:$NoRunNow -FixTls:$FixTls
     $Token = $null
     Exit-Install $rc 'install finished'
 }
