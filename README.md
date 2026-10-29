@@ -60,6 +60,18 @@ Dashboard: **Zero Trust > Reusable components > Lists > Create manual list** →
 type **IP addresses**, add one entry (e.g. the BCT office IP), **Save**. Open the list; the URL ends with
 `/lists/<LIST_ID>` – that UUID is `CF_LIST_ID`. Account ID: dashboard **Account home > ⋯ > Copy account ID**.
 
+**`CF_LIST_ID` accepts the ID or the exact list name.**
+* An ID is used as-is: a UUID like `f174e90a-fafe-4643-bbbc-4a0ed4fc8415` (Zero Trust lists) or a 32-hex ID
+  (account rules lists, `CF_LIST_KIND=rules`).
+* Anything else is treated as a list **name** and looked up once at startup (`GET /accounts/{id}/gateway/lists`, or
+  `/rules/lists` for `CF_LIST_KIND=rules`): exact match first, then case-insensitive with spaces trimmed. The log
+  shows `Resolved CF_LIST_ID name "DX trusted client IPs" to <id>` and the ID is cached for the run.
+* No match → `config error: … copy the ID from the end of the URL (/lists/<ID>) …` (exit 2) with the available list
+  names. Several lists with that name (or a non-IP list) → a clear error; set the ID instead.
+* The ID is still the recommended value – a renamed list then keeps working. Find it by opening the list
+  (Zero Trust > Reusable components > Lists > your list) and copying the last part of the browser URL, or with
+  `curl -s https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/gateway/lists -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result[] | "\(.id)  \(.type)  \(.name)"'`.
+
 Or with the API (run it yourself, with a token that has the permission below):
 ```bash
 curl -s https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/gateway/lists \
@@ -253,13 +265,28 @@ collector still reports and the server uses the request's source IP.
 * Zero Trust lists are patched with a single `PATCH {append, remove}`; rules lists use the async bulk
   `POST/DELETE …/items` + `bulk_operations` polling (never `PUT`, which replaces the whole list).
 
+## Troubleshooting
+
+* **`http.client.InvalidURL` / "URL can't contain control characters"** (versions before this fix): `CF_LIST_ID` was
+  set to the list *name*. Names are now resolved automatically, and every URL path segment is percent-encoded.
+* **`CF_LIST_ID '…' is not a list ID and no zerotrust list has that name`**: check the spelling against the names
+  listed in the message, check `CF_LIST_KIND` (`zerotrust` = Zero Trust lists, `rules` = account custom lists), or
+  paste the UUID from the list URL.
+* **ntfy alerts not arriving** – the log says why, never the token itself:
+  * `ntfy send failed (…): HTTP 401 …` / `HTTP 403 …` – `NTFY_TOKEN` is invalid, expired, or has no write access to the
+    topic. Create a new access token on the ntfy server (`ntfy token add <user>`, and `ntfy access <user> <topic> rw`),
+    put it in `.env`, then `docker compose up -d`. Test it with
+    `curl -H "Authorization: Bearer $NTFY_TOKEN" -d test $NTFY_URL` (HTTP 200 = good).
+  * `HTTP 429` – rate limited by the ntfy server; `HTTP 5xx` – ntfy server problem, try later.
+  * `network error … URLError: …` – DNS, TLS or firewall between the Docker host and `NTFY_URL`.
+
 ## Environment reference (`.env`)
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CF_API_TOKEN` | – (required) | Scoped token (see above). Secret. |
 | `CF_ACCOUNT_ID` | – (required) | Cloudflare account ID |
-| `CF_LIST_ID` | – (required) | Zero Trust list UUID (or rules list ID) |
+| `CF_LIST_ID` | – (required) | List UUID (Zero Trust) or 32-hex ID (rules), or the exact list name (resolved at startup) |
 | `CF_LIST_KIND` | `zerotrust` | `zerotrust` (Access IP list) or `rules` (WAF custom list) |
 | `CF_API_BASE` | `https://api.cloudflare.com/client/v4` | Override for tests |
 | `NTFY_URL` | `https://ntfy.ausict.com/bct-ryan-bl-4456629bd50c` | ntfy topic |

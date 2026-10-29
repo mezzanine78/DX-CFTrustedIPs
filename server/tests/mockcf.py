@@ -25,6 +25,12 @@ class MockState:
         self.fail_write = False
         self.lie_total = False  # report a bigger total_count than returned -> partial read
         self.per_page_cap = 1000
+        self.ntfy_status = 0  # force this HTTP status from /ntfy (0 = normal behaviour)
+        self.raw_paths: list[str] = []  # request paths exactly as sent (still percent-encoded)
+        self.zt_lists = [{"id": ZT_LIST, "name": "DX trusted client IPs", "type": "IP", "count": 0},
+                         {"id": "0c1e2a3b-0000-4000-8000-000000000001", "name": "Blocked domains", "type": "DOMAIN"}]
+        self.rules_lists = [{"id": RULES_LIST, "name": "dx_trusted_client_ips", "kind": "ip"},
+                            {"id": "c" * 32, "name": "redirects", "kind": "redirect"}]
 
 
 class MockServer:
@@ -57,6 +63,9 @@ class MockServer:
             def _route(self, method):
                 u = urlparse(self.path)
                 st.requests.append((method, u.path))
+                st.raw_paths.append(self.path)
+                if u.path == "/ntfy" and st.ntfy_status:
+                    return self._json(st.ntfy_status, {"error": "forced"})
                 if u.path == "/ntfy":
                     if self.headers.get("Authorization") != "Bearer " + NTFY_TOKEN:
                         return self._json(401, {"error": "unauthorized"})
@@ -72,6 +81,11 @@ class MockServer:
                     return self._json(500, {"success": False, "errors": [{"code": 1000, "message": "boom"}]})
                 if method != "GET" and st.fail_write:
                     return self._json(500, {"success": False, "errors": [{"code": 1001, "message": "write boom"}]})
+                if u.path == f"/client/v4/accounts/{ACCOUNT}/gateway/lists" and method == "GET":
+                    return self._ok(st.zt_lists, {"page": 1, "per_page": 100, "count": len(st.zt_lists),
+                                                  "total_count": len(st.zt_lists), "total_pages": 1})
+                if u.path == rl and method == "GET":
+                    return self._ok(st.rules_lists)
                 if u.path == zt + "/items" and method == "GET":
                     page, per = int(q.get("page", ["1"])[0]), min(int(q.get("per_page", ["20"])[0]), st.per_page_cap)
                     items = st.zt_items[(page - 1) * per: page * per]

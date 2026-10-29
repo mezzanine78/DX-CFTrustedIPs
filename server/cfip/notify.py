@@ -1,6 +1,7 @@
 """ntfy alerts. The bearer token is sent as a header only and never logged."""
 from __future__ import annotations
 
+import http.client
 import logging
 import urllib.error
 import urllib.request
@@ -15,6 +16,11 @@ class Notifier:
         self.timeout = timeout
         self.enabled = enabled and bool(url)
         self.sent: list[dict] = []  # recent alerts, handy for tests and /healthz
+
+    def _scrub(self, text: str) -> str:
+        """Belt and braces: never let the token reach a log line, whatever an exception message contains."""
+        text = str(text)
+        return text.replace(self._token, "***") if self._token else text
 
     def send(self, title: str, message: str, priority: int = 3, tags: str = "") -> bool:
         title = "DX CF-IP: " + title
@@ -32,10 +38,24 @@ class Notifier:
         req = urllib.request.Request(self.url, data=message.encode("utf-8"), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 (configured URL)
-                ok = 200 <= resp.status < 300
-        except (urllib.error.URLError, OSError) as exc:
-            log.error("ntfy send failed: %s", type(exc).__name__)
+                status, reason = resp.status, getattr(resp, "reason", "")
+        except urllib.error.HTTPError as exc:
+            status, reason = exc.code, exc.reason
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            detail = getattr(exc, "reason", None) or exc
+            log.error("ntfy send failed (network error, alert '%s' not delivered): %s: %s",
+                      title, type(exc).__name__, self._scrub(detail))
             return False
-        if not ok:
-            log.error("ntfy returned non-2xx")
-        return ok
+        if 200 <= status < 300:
+            return True
+        hint = ""
+        if status in (401, 403):
+            hint = (" - NTFY_TOKEN is likely invalid/expired or lacks write access to the topic"
+                    + ("" if self._token else " (NTFY_TOKEN is empty)"))
+        elif status == 429:
+            hint = " - rate limited by the ntfy server"
+        elif status >= 500:
+            hint = " - ntfy server error, try again later"
+        log.error("ntfy send failed (alert '%s' not delivered): HTTP %s %s%s",
+                  title, status, self._scrub(reason or ""), hint)
+        return False

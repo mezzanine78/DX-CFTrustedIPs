@@ -18,7 +18,7 @@ import signal
 import sys
 import threading
 
-from .cloudflare import make_backend
+from .cloudflare import CloudflareError, ListLookupError, make_backend
 from .config import Config, ConfigError
 from .notify import Notifier
 from .store import Store, StoreError
@@ -31,7 +31,16 @@ def _build(cfg, need_cf=True):
         cfg.require_cloudflare()
     store = Store(cfg.data_dir)
     notifier = Notifier(cfg.ntfy_url, cfg.ntfy_token, enabled=not cfg.dry_run)
-    syncer = Syncer(cfg, store, make_backend(cfg), notifier) if need_cf else None
+    syncer = None
+    if need_cf:
+        backend = make_backend(cfg)
+        try:  # validate CF_LIST_ID at startup: an ID passes through, a list name is resolved once
+            backend.resolve_list_id()
+        except ListLookupError:
+            raise  # a ConfigError: exit 2 with the explanation
+        except CloudflareError as exc:  # API unreachable right now: retried at the first sync
+            logging.getLogger("cfip").warning("could not resolve CF_LIST_ID yet (%s); will retry at sync", exc)
+        syncer = Syncer(cfg, store, backend, notifier)
     return store, notifier, syncer
 
 
